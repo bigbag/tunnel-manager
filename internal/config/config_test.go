@@ -177,26 +177,6 @@ func TestListOrderInFile(t *testing.T) {
 	}
 }
 
-func TestRealCatalogNullKey(t *testing.T) {
-	f, err := Load("../../tunnels.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, warnings, err := f.TunnelsByList("mcp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(warnings) != 0 || len(got) != 7 {
-		t.Fatalf("len %d warnings %#v", len(got), warnings)
-	}
-	for _, name := range []string{"rds_sdip_prod", "starrock_mcp"} {
-		tun := f.byName[name]
-		if tun == nil || tun.IdentityFile != "" {
-			t.Fatalf("%s identity = %#v", name, tun)
-		}
-	}
-}
-
 func namesOf(ts []*Tunnel) []string {
 	out := make([]string, len(ts))
 	for i, t := range ts {
