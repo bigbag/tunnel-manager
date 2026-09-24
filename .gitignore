@@ -1,0 +1,14 @@
+/bin/
+/tunnel-manager
+/tunnel-manager-*
+coverage.out
+coverage.html
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.env
+.envrc
+tunnels.json

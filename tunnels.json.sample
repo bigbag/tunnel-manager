@@ -1,0 +1,44 @@
+{
+  "version": "1.0",
+  "defaults": {
+    "ssh_user": "user",
+    "ssh_bastion": "bastion.example",
+    "identity_file": "~/.ssh/id_ed25519"
+  },
+  "lists": {
+    "dev": ["app", "db", "k8s-db"]
+  },
+  "tunnels": [
+    {
+      "name": "app",
+      "type": "ssh",
+      "description": "App on the bastion",
+      "tags": ["dev"],
+      "local_port": 8080,
+      "remote_port": 8080,
+      "remote_host": "127.0.0.1"
+    },
+    {
+      "name": "db",
+      "type": "ssh",
+      "description": "Database through the bastion",
+      "tags": ["database"],
+      "local_port": 5432,
+      "remote_port": 5432,
+      "remote_host": "10.0.0.10",
+      "identity_file": null
+    },
+    {
+      "name": "k8s-db",
+      "type": "kubectl",
+      "description": "PostgreSQL service",
+      "tags": ["database"],
+      "context": "dev",
+      "namespace": "app",
+      "service": "db-postgresql",
+      "local_port": 5433,
+      "remote_port": 5432,
+      "address": "127.0.0.1"
+    }
+  ]
+}
