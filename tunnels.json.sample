@@ -26,7 +26,8 @@
       "local_port": 5432,
       "remote_port": 5432,
       "remote_host": "10.0.0.10",
-      "identity_file": null
+      "identity_file": null,
+      "auth": "password"
     },
     {
       "name": "k8s-db",

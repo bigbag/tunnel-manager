@@ -43,15 +43,23 @@ func TestKubectlArgs(t *testing.T) {
 }
 
 func TestChooseAuth(t *testing.T) {
-	got := ChooseAuth("/keys/id", "secret", true, true)
-	if got.KeyPath != "/keys/id" || !got.UseAgent || !got.UsePassword {
+	got := ChooseAuth("key", "/keys/id", true, true)
+	if got.KeyPath != "/keys/id" || !got.UseAgent || got.UsePassword {
 		t.Fatalf("choice = %+v", got)
 	}
-	if len(got.Logs) != 2 || got.Logs[0] != "Using key: /keys/id" || got.Logs[1] != "Using password authentication" {
+	if len(got.Logs) != 2 || got.Logs[0] != "Using key: /keys/id" || got.Logs[1] != "Using key/agent authentication" {
 		t.Fatalf("logs = %#v", got.Logs)
 	}
 
-	missing := ChooseAuth("/keys/missing", "", false, false)
+	pw := ChooseAuth("password", "/keys/id", true, true)
+	if pw.KeyPath != "" || pw.UseAgent || !pw.UsePassword {
+		t.Fatalf("password = %+v", pw)
+	}
+	if len(pw.Logs) != 1 || pw.Logs[0] != "Using password authentication" {
+		t.Fatalf("password logs = %#v", pw.Logs)
+	}
+
+	missing := ChooseAuth("key", "/keys/missing", false, false)
 	if missing.KeyPath != "" || missing.UseAgent || missing.UsePassword {
 		t.Fatalf("missing = %+v", missing)
 	}
@@ -59,7 +67,7 @@ func TestChooseAuth(t *testing.T) {
 		t.Fatalf("missing logs = %#v", missing.Logs)
 	}
 
-	none := ChooseAuth("", "", false, false)
+	none := ChooseAuth("key", "", false, false)
 	if none.UsePassword || none.UseAgent || none.KeyPath != "" {
 		t.Fatalf("none = %+v", none)
 	}

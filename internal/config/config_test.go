@@ -21,6 +21,17 @@ func loadString(t *testing.T, body string) *File {
 	return f
 }
 
+func TestTunnelInitialStatus(t *testing.T) {
+	var zero Tunnel
+	if got := zero.Status(); got != "" {
+		t.Fatalf("zero tunnel status = %q", got)
+	}
+	f := loadString(t, `{"tunnels":[{"name":"a","type":"ssh","local_port":1,"remote_port":2}]}`)
+	if got := f.byName["a"].Status(); got != StatusStopped {
+		t.Fatalf("loaded tunnel status = %q", got)
+	}
+}
+
 func TestOmittedSSHFieldUsesDefault(t *testing.T) {
 	f := loadString(t, `{
 		"defaults": {"ssh_user": "user", "ssh_bastion": "10.0.0.1", "identity_file": "/keys/id"},
@@ -137,6 +148,27 @@ func TestMissingPortIsSchemaError(t *testing.T) {
 	}
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "local_port") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAuth(t *testing.T) {
+	f := loadString(t, `{
+		"tunnels": [
+			{"name": "a", "type": "ssh", "local_port": 1, "remote_port": 2},
+			{"name": "b", "type": "ssh", "local_port": 3, "remote_port": 4, "auth": null},
+			{"name": "c", "type": "ssh", "local_port": 5, "remote_port": 6, "auth": "password"}
+		]
+	}`)
+	if f.byName["a"].Auth != "key" || f.byName["b"].Auth != "key" || f.byName["c"].Auth != "password" {
+		t.Fatalf("auth = %q %q %q", f.byName["a"].Auth, f.byName["b"].Auth, f.byName["c"].Auth)
+	}
+	path := filepath.Join(t.TempDir(), "tunnels.json")
+	body := `{"tunnels": [{"name": "a", "type": "ssh", "local_port": 1, "remote_port": 2, "auth": "agent"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "auth") {
 		t.Fatalf("err = %v", err)
 	}
 }

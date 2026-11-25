@@ -19,7 +19,6 @@ type Options struct {
 	Tunnels  []*config.Tunnel
 	Monitor  *monitor.Config
 	Start    Starter
-	Stop     <-chan struct{}
 	Check    monitor.Checker
 	Print    func(string)
 }
@@ -30,6 +29,9 @@ func Run(ctx context.Context, opt Options) int {
 		print = func(s string) { fmt.Println(s) }
 	}
 	for _, tun := range opt.Tunnels {
+		if ctx.Err() != nil {
+			break
+		}
 		print(fmt.Sprintf("[%s] Connecting...", tun.Name))
 		ok, err := opt.Start.Start(ctx, tun, func(msg string) {
 			print(fmt.Sprintf("[%s] %s", tun.Name, msg))
@@ -46,7 +48,7 @@ func Run(ctx context.Context, opt Options) int {
 	}
 	running := 0
 	for _, tun := range opt.Tunnels {
-		if tun.Status == config.StatusRunning {
+		if tun.Status() == config.StatusRunning {
 			running++
 		}
 	}
@@ -54,9 +56,9 @@ func Run(ctx context.Context, opt Options) int {
 		print("No tunnels started successfully.")
 		return 1
 	}
-	monCtx, monCancel := context.WithCancel(ctx)
-	defer monCancel()
+	var monitorDone chan struct{}
 	if opt.Monitor != nil {
+		monitorDone = make(chan struct{})
 		m := &monitor.Monitor{
 			Tunnels: opt.Tunnels,
 			Config:  *opt.Monitor,
@@ -66,20 +68,20 @@ func Run(ctx context.Context, opt Options) int {
 				print(fmt.Sprintf("[%s] %s", name, msg))
 			},
 		}
-		go m.Run(monCtx)
+		go func() {
+			defer close(monitorDone)
+			m.Run(ctx)
+		}()
 	}
 	print(StatusLine(running, len(opt.Tunnels), opt.Monitor))
 	print("Press Ctrl+C to stop.")
-	if opt.Stop != nil {
-		select {
-		case <-opt.Stop:
-		case <-ctx.Done():
-		}
+	<-ctx.Done()
+	if monitorDone != nil {
+		<-monitorDone
 	}
-	monCancel()
 	print("Stopping all tunnels...")
 	for _, tun := range opt.Tunnels {
-		if tun.Status == config.StatusStopped {
+		if tun.Status() == config.StatusStopped {
 			continue
 		}
 		_ = opt.Start.Stop(tun, func(msg string) {

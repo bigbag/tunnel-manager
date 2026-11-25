@@ -26,23 +26,33 @@ func TestBackoff(t *testing.T) {
 }
 
 type fakeRestart struct {
-	calls int
-	ok    bool
-	err   error
+	calls     int
+	ok        bool
+	err       error
+	onRestart func()
 }
 
 func (f *fakeRestart) Restart(ctx context.Context, t *config.Tunnel, log func(string)) (bool, error) {
 	f.calls++
+	if f.onRestart != nil {
+		f.onRestart()
+	}
 	return f.ok, f.err
+}
+
+func testTunnel(name string, status config.Status, port int) *config.Tunnel {
+	tun := &config.Tunnel{Name: name, LocalPort: port}
+	tun.SetStatus(status)
+	return tun
 }
 
 func TestSkipStatuses(t *testing.T) {
 	checks := 0
 	m := &Monitor{
 		Tunnels: []*config.Tunnel{
-			{Name: "a", Status: config.StatusStopped, LocalPort: 1},
-			{Name: "b", Status: config.StatusStarting, LocalPort: 2},
-			{Name: "c", Status: config.StatusStopping, LocalPort: 3},
+			testTunnel("a", config.StatusStopped, 1),
+			testTunnel("b", config.StatusStarting, 2),
+			testTunnel("c", config.StatusStopping, 3),
 		},
 		Config:  NewConfig(time.Second, 5*time.Second, 5),
 		Check:   func(host string, port int, timeout time.Duration) bool { checks++; return false },
@@ -59,7 +69,7 @@ func TestErrorStatusRestarts(t *testing.T) {
 	var host string
 	var timeout time.Duration
 	m := &Monitor{
-		Tunnels: []*config.Tunnel{{Name: "a", Status: config.StatusError, LocalPort: 9}},
+		Tunnels: []*config.Tunnel{testTunnel("a", config.StatusError, 9)},
 		Config:  NewConfig(time.Second, 2*time.Second, 5),
 		Check: func(h string, port int, d time.Duration) bool {
 			host = h
@@ -80,7 +90,7 @@ func TestErrorStatusRestarts(t *testing.T) {
 
 func TestGiveUpDoesNotStart(t *testing.T) {
 	rest := &fakeRestart{}
-	tun := &config.Tunnel{Name: "a", Status: config.StatusRunning, LocalPort: 1}
+	tun := testTunnel("a", config.StatusRunning, 1)
 	m := &Monitor{
 		Tunnels: []*config.Tunnel{tun},
 		Config:  NewConfig(time.Second, time.Second, 1),
@@ -94,15 +104,15 @@ func TestGiveUpDoesNotStart(t *testing.T) {
 	if rest.calls != 1 {
 		t.Fatalf("calls %d", rest.calls)
 	}
-	if tun.Status != config.StatusError || tun.ErrorMessage != "Reconnection failed after 1 attempts" {
-		t.Fatalf("status %s message %q", tun.Status, tun.ErrorMessage)
+	if tun.Status() != config.StatusError || tun.ErrorMessage != "Reconnection failed after 1 attempts" {
+		t.Fatalf("status %s message %q", tun.Status(), tun.ErrorMessage)
 	}
 }
 
 func TestFutureAttemptWaits(t *testing.T) {
 	rest := &fakeRestart{}
 	m := &Monitor{
-		Tunnels: []*config.Tunnel{{Name: "a", Status: config.StatusRunning, LocalPort: 1}},
+		Tunnels: []*config.Tunnel{testTunnel("a", config.StatusRunning, 1)},
 		Config:  NewConfig(time.Second, time.Second, 5),
 		Check:   func(string, int, time.Duration) bool { return false },
 		Restart: rest,
@@ -120,7 +130,7 @@ func TestZeroTimeoutDoesNotDial(t *testing.T) {
 	checks := 0
 	rest := &fakeRestart{}
 	m := &Monitor{
-		Tunnels: []*config.Tunnel{{Name: "a", Status: config.StatusRunning, LocalPort: 1}},
+		Tunnels: []*config.Tunnel{testTunnel("a", config.StatusRunning, 1)},
 		Config:  NewConfig(time.Second, 0, 5),
 		Check:   func(string, int, time.Duration) bool { checks++; return true },
 		Restart: rest,
@@ -139,7 +149,7 @@ func TestHealthyResetsAttempts(t *testing.T) {
 	rest := &fakeRestart{}
 	var logs []string
 	m := &Monitor{
-		Tunnels: []*config.Tunnel{{Name: "a", Status: config.StatusRunning, LocalPort: 1}},
+		Tunnels: []*config.Tunnel{testTunnel("a", config.StatusRunning, 1)},
 		Config:  NewConfig(time.Second, time.Second, 5),
 		Check:   func(string, int, time.Duration) bool { return false },
 		Restart: rest,
@@ -157,5 +167,44 @@ func TestHealthyResetsAttempts(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("logs = %#v", logs)
+	}
+}
+
+func TestCheckOnceStopsOnCancellation(t *testing.T) {
+	for _, when := range []string{"before pass", "during check", "during restart"} {
+		t.Run(when, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			checks, wantChecks, wantRestarts := 0, 0, 0
+			rest := &fakeRestart{}
+			switch when {
+			case "before pass":
+				cancel()
+			case "during check":
+				wantChecks = 1
+			case "during restart":
+				wantChecks, wantRestarts = 1, 1
+				rest.onRestart = cancel
+			}
+			m := &Monitor{
+				Tunnels: []*config.Tunnel{
+					testTunnel("a", config.StatusError, 0),
+					testTunnel("b", config.StatusError, 0),
+				},
+				Config: NewConfig(time.Second, time.Second, 5),
+				Check: func(string, int, time.Duration) bool {
+					checks++
+					if when == "during check" {
+						cancel()
+					}
+					return false
+				},
+				Restart: rest,
+			}
+			m.CheckOnce(ctx, time.Now())
+			if checks != wantChecks || rest.calls != wantRestarts {
+				t.Fatalf("checks = %d, restarts = %d; want %d, %d", checks, rest.calls, wantChecks, wantRestarts)
+			}
+		})
 	}
 }

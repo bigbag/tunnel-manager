@@ -24,7 +24,9 @@ make run/quick
 
 `LIST` is the list name. The default is `mcp`. `ARGS` is extra flags. `run/quick` does not rebuild.
 
-The process asks for one SSH password when the list contains an SSH tunnel. Press Ctrl+C to stop.
+SSH tunnels use key authentication by default. The process asks for one password for each `user@bastion` pair of an SSH tunnel with `"auth": "password"`. Passwords stay in memory. The process does not ask again.
+
+If the server rejects a password 2 times, the process stops new starts and reconnects. Only an attempted password counts. An SSH disconnect with `too many authentication failures` after that attempt also counts as a rejection. The process waits for the monitor to stop, closes all tunnels, and exits 1. It does not send that password a third time. Press Ctrl+C to stop.
 
 ## Command
 
@@ -50,10 +52,14 @@ A list names the tunnels to start. The program does not start a tunnel that the 
 
 An omitted SSH field uses `defaults`. JSON `null` does not use `defaults`. An omitted `remote_host` is `127.0.0.1`.
 
+`auth` is `"key"` or `"password"`. An omitted or `null` `auth` is `"key"`. `key` tries the key file, then the SSH agent keys. `password` uses only the password. If the server does not offer password authentication, the failure does not count as a rejected password.
+
 The tunnel catalog is in `docs/business.md`.
 
 ## Health
 
 The monitor connects to `127.0.0.1:<local_port>`. A closed port starts the tunnel again. The backoff is 5, 10, 20, 40, and 80 seconds. The cap is 300 seconds. A retry runs on the next check pass.
+
+SSH authentication has a 30-second timeout. Stopping the process cancels pending authentication, including SSH-agent requests. SSH keepalive runs every 15 seconds. If a reply does not arrive within 45 seconds, the client closes the connection so the monitor can reconnect.
 
 SSH tunnels listen on all interfaces. The log line says `localhost`. Each SSH tunnel uses port 22 on the bastion. The client does not check host keys.

@@ -34,7 +34,10 @@ type AuthChoice struct {
 	Logs        []string
 }
 
-func ChooseAuth(identityFile, password string, agentAvailable, keyExists bool) AuthChoice {
+func ChooseAuth(auth, identityFile string, agentAvailable, keyExists bool) AuthChoice {
+	if auth == "password" {
+		return AuthChoice{UsePassword: true, Logs: []string{"Using password authentication"}}
+	}
 	var choice AuthChoice
 	if identityFile != "" {
 		if keyExists {
@@ -45,11 +48,6 @@ func ChooseAuth(identityFile, password string, agentAvailable, keyExists bool) A
 		}
 	}
 	choice.UseAgent = agentAvailable
-	choice.UsePassword = password != ""
-	if choice.UsePassword {
-		choice.Logs = append(choice.Logs, "Using password authentication")
-	} else {
-		choice.Logs = append(choice.Logs, "Using key/agent authentication")
-	}
+	choice.Logs = append(choice.Logs, "Using key/agent authentication")
 	return choice
 }

@@ -98,7 +98,10 @@ func (m *Monitor) Run(ctx context.Context) {
 
 func (m *Monitor) CheckOnce(ctx context.Context, now time.Time) {
 	for _, tun := range m.Tunnels {
-		switch tun.Status {
+		if ctx.Err() != nil {
+			return
+		}
+		switch tun.Status() {
 		case config.StatusStopped, config.StatusStarting, config.StatusStopping:
 			continue
 		}
@@ -109,6 +112,9 @@ func (m *Monitor) CheckOnce(ctx context.Context, now time.Time) {
 			}
 			*st = state{}
 			continue
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		m.onDown(ctx, tun, now)
 	}
@@ -125,7 +131,7 @@ func (m *Monitor) onDown(ctx context.Context, tun *config.Tunnel, now time.Time)
 	st.Attempts++
 	if st.Attempts > m.Config.MaxRetries {
 		st.GivenUp = true
-		tun.Status = config.StatusError
+		tun.SetStatus(config.StatusError)
 		tun.ErrorMessage = fmt.Sprintf("Reconnection failed after %d attempts", m.Config.MaxRetries)
 		m.log(tun.Name, fmt.Sprintf("Giving up after %d failed reconnection attempts", m.Config.MaxRetries))
 		return

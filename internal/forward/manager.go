@@ -20,18 +20,21 @@ import (
 	"github.com/bigbag/tunnel-manager/internal/config"
 )
 
+const maxPasswordFailures = 2
+
 type Manager struct {
-	password string
-	mu       sync.Mutex
-	ssh      map[string]*sshSession
-	kube     map[string]*kubeSession
+	passwords map[string]string
+	abort     func()
+	mu        sync.Mutex
+	failures  map[string]int
+	ssh       map[string]*sshSession
+	kube      map[string]*kubeSession
 }
 
 type sshSession struct {
-	client    *ssh.Client
-	ln        net.Listener
-	agentConn net.Conn
-	cancel    context.CancelFunc
+	client *ssh.Client
+	ln     net.Listener
+	cancel context.CancelFunc
 }
 
 type kubeSession struct {
@@ -41,11 +44,13 @@ type kubeSession struct {
 	stopping bool
 }
 
-func NewManager(password string) *Manager {
+func NewManager(passwords map[string]string, abort func()) *Manager {
 	return &Manager{
-		password: password,
-		ssh:      make(map[string]*sshSession),
-		kube:     make(map[string]*kubeSession),
+		passwords: passwords,
+		abort:     abort,
+		failures:  make(map[string]int),
+		ssh:       make(map[string]*sshSession),
+		kube:      make(map[string]*kubeSession),
 	}
 }
 
@@ -63,7 +68,7 @@ func (m *Manager) Start(ctx context.Context, t *config.Tunnel, log func(string))
 	case "kubectl":
 		return m.startKube(t, log)
 	default:
-		t.Status = config.StatusError
+		t.SetStatus(config.StatusError)
 		t.ErrorMessage = "Unknown tunnel type: " + t.Type
 		return false, nil
 	}
@@ -101,28 +106,36 @@ func (m *Manager) isRunning(name string) bool {
 }
 
 func (s *kubeSession) alive() bool {
-	return s != nil && s.cmd != nil && s.cmd.Process != nil && s.cmd.ProcessState == nil
+	if s == nil || s.cmd == nil || s.cmd.Process == nil {
+		return false
+	}
+	select {
+	case <-s.done:
+		return false
+	default:
+		return true
+	}
 }
 
 func (m *Manager) startKube(t *config.Tunnel, log func(string)) (bool, error) {
-	t.Status = config.StatusStarting
+	t.SetStatus(config.StatusStarting)
 	log("Starting kubectl port-forward...")
 	args := KubectlArgs(t)
 	log("Command: " + strings.Join(args, " "))
 	cmd := exec.Command(args[0], args[1:]...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		t.Status = config.StatusError
+		t.SetStatus(config.StatusError)
 		t.ErrorMessage = err.Error()
 		return false, nil
 	}
 	if err := cmd.Start(); err != nil {
-		t.Status = config.StatusError
+		t.SetStatus(config.StatusError)
 		t.ErrorMessage = err.Error()
 		return false, nil
 	}
 	t.PID = cmd.Process.Pid
-	t.Status = config.StatusRunning
+	t.SetStatus(config.StatusRunning)
 	log(fmt.Sprintf("Started (PID: %d)", t.PID))
 	sess := &kubeSession{cmd: cmd, done: make(chan struct{})}
 	m.mu.Lock()
@@ -150,7 +163,7 @@ func waitKube(sess *kubeSession, t *config.Tunnel, log func(string)) {
 	sess.mu.Unlock()
 	if !stopping && sess.cmd.ProcessState != nil && !sess.cmd.ProcessState.Success() {
 		log(fmt.Sprintf("Process exited with code %d", sess.cmd.ProcessState.ExitCode()))
-		t.Status = config.StatusError
+		t.SetStatus(config.StatusError)
 	}
 	close(sess.done)
 }
@@ -161,11 +174,11 @@ func (m *Manager) stopKube(t *config.Tunnel, log func(string)) error {
 	delete(m.kube, t.Name)
 	m.mu.Unlock()
 	if sess == nil {
-		t.Status = config.StatusStopped
+		t.SetStatus(config.StatusStopped)
 		t.PID = 0
 		return nil
 	}
-	t.Status = config.StatusStopping
+	t.SetStatus(config.StatusStopping)
 	log("Stopping...")
 	sess.mu.Lock()
 	sess.stopping = true
@@ -180,49 +193,16 @@ func (m *Manager) stopKube(t *config.Tunnel, log func(string)) error {
 		}
 	}
 	t.PID = 0
-	t.Status = config.StatusStopped
+	t.SetStatus(config.StatusStopped)
 	log("Stopped")
 	return nil
 }
 
 func (m *Manager) startSSH(ctx context.Context, t *config.Tunnel, log func(string)) (bool, error) {
-	t.Status = config.StatusStarting
-	log(fmt.Sprintf("Connecting to %s@%s...", t.SSHUser, t.SSHBastion))
-
-	var agentConn net.Conn
-	agentAvailable := false
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
-		conn, err := net.Dial("unix", sock)
-		if err != nil {
-			log("Agent not available: " + err.Error())
-		} else {
-			agentConn = conn
-			agentAvailable = true
-		}
-	}
-	keyPath := expandPath(t.IdentityFile)
-	keyExists := false
-	if keyPath != "" {
-		if st, err := os.Stat(keyPath); err == nil && !st.IsDir() {
-			keyExists = true
-		}
-	}
-	choice := ChooseAuth(keyPath, m.password, agentAvailable, keyExists)
-	for _, line := range choice.Logs {
-		log(line)
-	}
-	methods, err := authMethods(choice, agentConn, m.password)
+	t.SetStatus(config.StatusStarting)
+	client, err := m.connectSSH(ctx, t, net.JoinHostPort(t.SSHBastion, "22"), log)
 	if err != nil {
-		closeConn(agentConn)
-		t.Status = config.StatusError
-		t.ErrorMessage = err.Error()
-		return false, nil
-	}
-	log("Establishing SSH connection...")
-	client, err := dialSSH(ctx, t, methods)
-	if err != nil {
-		closeConn(agentConn)
-		t.Status = config.StatusError
+		t.SetStatus(config.StatusError)
 		t.ErrorMessage = failMessage(err)
 		return false, nil
 	}
@@ -230,18 +210,17 @@ func (m *Manager) startSSH(ctx context.Context, t *config.Tunnel, log func(strin
 	ln, err := net.Listen("tcp", ListenAddr(t.LocalPort))
 	if err != nil {
 		client.Close()
-		closeConn(agentConn)
-		t.Status = config.StatusError
+		t.SetStatus(config.StatusError)
 		t.ErrorMessage = failMessage(err)
 		return false, nil
 	}
 	log(fmt.Sprintf("Forwarding localhost:%d -> %s:%d", t.LocalPort, t.RemoteHost, t.RemotePort))
 	kctx, cancel := context.WithCancel(context.Background())
-	sess := &sshSession{client: client, ln: ln, agentConn: agentConn, cancel: cancel}
+	sess := &sshSession{client: client, ln: ln, cancel: cancel}
 	m.mu.Lock()
 	m.ssh[t.Name] = sess
 	m.mu.Unlock()
-	t.Status = config.StatusRunning
+	t.SetStatus(config.StatusRunning)
 	go sess.keepAlive(kctx)
 	go sess.accept(net.JoinHostPort(t.RemoteHost, fmt.Sprintf("%d", t.RemotePort)))
 	go func() {
@@ -251,16 +230,36 @@ func (m *Manager) startSSH(ctx context.Context, t *config.Tunnel, log func(strin
 	return true, nil
 }
 
+func (m *Manager) passwordFailures(target string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.failures[target]
+}
+
+func (m *Manager) passwordRejected(target string, log func(string)) {
+	m.mu.Lock()
+	m.failures[target]++
+	n := m.failures[target]
+	m.mu.Unlock()
+	if n < maxPasswordFailures {
+		return
+	}
+	log(fmt.Sprintf("Password for %s was rejected %d times. Stopping all tunnels.", target, n))
+	if m.abort != nil {
+		m.abort()
+	}
+}
+
 func (m *Manager) stopSSH(t *config.Tunnel, log func(string)) error {
 	m.mu.Lock()
 	sess := m.ssh[t.Name]
 	delete(m.ssh, t.Name)
 	m.mu.Unlock()
 	if sess == nil {
-		t.Status = config.StatusStopped
+		t.SetStatus(config.StatusStopped)
 		return nil
 	}
-	t.Status = config.StatusStopping
+	t.SetStatus(config.StatusStopping)
 	log("Stopping...")
 	if sess.cancel != nil {
 		sess.cancel()
@@ -271,8 +270,7 @@ func (m *Manager) stopSSH(t *config.Tunnel, log func(string)) error {
 	if sess.client != nil {
 		sess.client.Close()
 	}
-	closeConn(sess.agentConn)
-	t.Status = config.StatusStopped
+	t.SetStatus(config.StatusStopped)
 	log("Disconnected")
 	return nil
 }
@@ -308,78 +306,123 @@ func forwardConn(client *ssh.Client, local net.Conn, dest string) {
 func (s *sshSession) keepAlive(ctx context.Context) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	misses := 0
+	stop := context.AfterFunc(ctx, func() { s.client.Close() })
+	defer stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			timer := time.AfterFunc(45*time.Second, func() { s.client.Close() })
 			_, _, err := s.client.SendRequest("keepalive@openssh.com", true, nil)
+			timer.Stop()
 			if err != nil {
-				misses++
-				if misses >= 3 {
-					s.client.Close()
-					return
-				}
-				continue
+				s.client.Close()
+				return
 			}
-			misses = 0
 		}
 	}
 }
 
-func dialSSH(ctx context.Context, t *config.Tunnel, methods []ssh.AuthMethod) (*ssh.Client, error) {
-	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+func (m *Manager) connectSSH(ctx context.Context, t *config.Tunnel, addr string, log func(string)) (*ssh.Client, error) {
+	target := t.SSHTarget()
+	if t.Auth == "password" && m.passwordFailures(target) >= maxPasswordFailures {
+		return nil, fmt.Errorf("Password for %s was rejected %d times. It is not sent again.", target, maxPasswordFailures)
+	}
+	log(fmt.Sprintf("Connecting to %s@%s...", t.SSHUser, t.SSHBastion))
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	addr := net.JoinHostPort(t.SSHBastion, "22")
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+
+	var agentConn net.Conn
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" && t.Auth != "password" {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			log("Agent not available: " + err.Error())
+		} else {
+			agentConn = conn
+			defer agentConn.Close()
+			stop := context.AfterFunc(ctx, func() { agentConn.Close() })
+			defer stop()
+		}
+	}
+	keyPath := expandPath(t.IdentityFile)
+	keyExists := false
+	if keyPath != "" {
+		if st, err := os.Stat(keyPath); err == nil && !st.IsDir() {
+			keyExists = true
+		}
+	}
+	choice := ChooseAuth(t.Auth, keyPath, agentConn != nil, keyExists)
+	for _, line := range choice.Logs {
+		log(line)
+	}
+	var signers []ssh.Signer
+	if choice.KeyPath != "" {
+		b, err := os.ReadFile(choice.KeyPath)
+		if err != nil {
+			return nil, err
+		}
+		signer, err := ssh.ParsePrivateKey(b)
+		if err != nil {
+			return nil, err
+		}
+		signers = append(signers, signer)
+	}
+	var methods []ssh.AuthMethod
+	if len(signers) > 0 || choice.UseAgent {
+		var ag agent.ExtendedAgent
+		if choice.UseAgent {
+			ag = agent.NewClient(agentConn)
+		}
+		methods = append(methods, ssh.PublicKeysCallback(func() ([]ssh.Signer, error) {
+			if choice.UseAgent {
+				agentSigners, err := ag.Signers()
+				if err != nil {
+					if len(signers) == 0 {
+						return nil, fmt.Errorf("agent: %w", err)
+					}
+					// Keep the file key usable when agent listing fails.
+					log("Agent error: " + err.Error())
+				} else {
+					return append(signers, agentSigners...), nil
+				}
+			}
+			return signers, nil
+		}))
+	}
+	attemptedPassword := false
+	if choice.UsePassword {
+		methods = append(methods, ssh.PasswordCallback(func() (string, error) {
+			attemptedPassword = true
+			return m.passwords[target], nil
+		}))
+	}
+	log("Establishing SSH connection...")
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	cc, chans, reqs, err := ssh.NewClientConn(conn, addr, &ssh.ClientConfig{
 		User:            t.SSHUser,
 		Auth:            methods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         30 * time.Second,
 	})
-	if err != nil {
+	stopped := stop()
+	if err != nil || !stopped || ctx.Err() != nil {
 		conn.Close()
-		return nil, err
-	}
-	_ = conn.SetDeadline(time.Time{})
-	return ssh.NewClient(cc, chans, reqs), nil
-}
-
-func authMethods(choice AuthChoice, agentConn net.Conn, password string) ([]ssh.AuthMethod, error) {
-	var methods []ssh.AuthMethod
-	if choice.KeyPath != "" {
-		method, err := keyAuth(choice.KeyPath)
-		if err != nil {
-			return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		methods = append(methods, method)
-	}
-	if choice.UseAgent && agentConn != nil {
-		ag := agent.NewClient(agentConn)
-		methods = append(methods, ssh.PublicKeysCallback(ag.Signers))
-	}
-	if choice.UsePassword {
-		methods = append(methods, ssh.Password(password))
-	}
-	return methods, nil
-}
-
-func keyAuth(path string) (ssh.AuthMethod, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
+		if attemptedPassword && isAuth(err) {
+			m.passwordRejected(target, log)
+		}
 		return nil, err
 	}
-	signer, err := ssh.ParsePrivateKey(b)
-	if err != nil {
-		return nil, err
-	}
-	return ssh.PublicKeys(signer), nil
+	return ssh.NewClient(cc, chans, reqs), nil
 }
 
 func expandPath(path string) string {
@@ -397,12 +440,6 @@ func expandPath(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
-}
-
-func closeConn(c net.Conn) {
-	if c != nil {
-		c.Close()
-	}
 }
 
 func failMessage(err error) string {
@@ -429,6 +466,7 @@ func isAuth(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unable to authenticate") ||
+		strings.Contains(msg, "too many authentication failures") ||
 		strings.Contains(msg, "permission denied") ||
 		strings.Contains(msg, "no supported methods")
 }

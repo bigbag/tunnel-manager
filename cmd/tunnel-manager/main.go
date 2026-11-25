@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -92,13 +93,10 @@ func run(args []string) int {
 		return 1
 	}
 	fmt.Printf("SSH Tunnel Runner - Starting '%s' (%d tunnels)\n\n", opt.listName, len(tunnels))
-	password := ""
-	if hasSSH(tunnels) {
-		password, err = readPassword(file.Defaults.SSHUser, file.Defaults.SSHBastion)
-		if err != nil {
-			fmt.Println("Error: cannot read password from the terminal")
-			return 1
-		}
+	passwords, err := askPasswords(tunnels, readPassword)
+	if err != nil {
+		fmt.Println("Error: cannot read password from the terminal")
+		return 1
 	}
 	var mon *monitor.Config
 	if opt.monitor {
@@ -109,21 +107,23 @@ func run(args []string) int {
 		)
 		mon = &cfg
 	}
-	stop := make(chan struct{})
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sig
-		close(stop)
-	}()
-	return runner.Run(context.Background(), runner.Options{
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	var rejected atomic.Bool
+	code := runner.Run(ctx, runner.Options{
 		ListName: opt.listName,
 		Tunnels:  tunnels,
 		Monitor:  mon,
-		Start:    forward.NewManager(password),
-		Stop:     stop,
-		Check:    monitor.TCPCheck,
+		Start: forward.NewManager(passwords, func() {
+			rejected.Store(true)
+			cancel()
+		}),
+		Check: monitor.TCPCheck,
 	})
+	if rejected.Load() {
+		return 1
+	}
+	return code
 }
 
 func parseArgs(args []string) (options, error) {
@@ -205,13 +205,22 @@ func configError(err error) int {
 	return 1
 }
 
-func hasSSH(tunnels []*config.Tunnel) bool {
+func askPasswords(tunnels []*config.Tunnel, read func(user, host string) (string, error)) (map[string]string, error) {
+	passwords := make(map[string]string)
 	for _, tun := range tunnels {
-		if tun.Type == "ssh" {
-			return true
+		if tun.Type != "ssh" || tun.Auth != "password" {
+			continue
 		}
+		if _, ok := passwords[tun.SSHTarget()]; ok {
+			continue
+		}
+		pw, err := read(tun.SSHUser, tun.SSHBastion)
+		if err != nil {
+			return nil, err
+		}
+		passwords[tun.SSHTarget()] = pw
 	}
-	return false
+	return passwords, nil
 }
 
 func readPassword(user, host string) (string, error) {

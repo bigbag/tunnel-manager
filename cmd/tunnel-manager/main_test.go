@@ -1,8 +1,35 @@
 package main
 
 import (
+	"reflect"
 	"testing"
+
+	"github.com/bigbag/tunnel-manager/internal/config"
 )
+
+func TestAskPasswordsOncePerTarget(t *testing.T) {
+	tunnels := []*config.Tunnel{
+		{Type: "ssh", Auth: "password", SSHUser: "u", SSHBastion: "a"},
+		{Type: "ssh", Auth: "key", SSHUser: "u", SSHBastion: "k"},
+		{Type: "ssh", Auth: "password", SSHUser: "u", SSHBastion: "b"},
+		{Type: "ssh", Auth: "password", SSHUser: "u", SSHBastion: "a"},
+		{Type: "kubectl", Auth: "password"},
+	}
+	var asked []string
+	got, err := askPasswords(tunnels, func(user, host string) (string, error) {
+		asked = append(asked, user+"@"+host)
+		return "pw-" + host, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(asked, []string{"u@a", "u@b"}) {
+		t.Fatalf("asked %v", asked)
+	}
+	if !reflect.DeepEqual(got, map[string]string{"u@a": "pw-a", "u@b": "pw-b"}) {
+		t.Fatalf("passwords %v", got)
+	}
+}
 
 func TestParseFlagsAfterList(t *testing.T) {
 	opt, err := parseArgs([]string{"dev", "--no-monitor", "--check-interval", "60", "--check-timeout", "2", "--max-retries", "3"})

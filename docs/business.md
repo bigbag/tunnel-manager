@@ -38,6 +38,7 @@ Exit codes:
 
 - Config or argument errors exit 1.
 - A normal stop exits 0.
+- A stop after 2 rejected passwords exits 1.
 - If no tunnel reaches status `running`, the process prints `No tunnels started successfully.` and exits 1.
 
 ## Configuration file
@@ -68,13 +69,15 @@ Root fields:
 
 `name`, `type`, `local_port`, and `remote_port` are required. A missing port is not port `0`. `description` and `tags` are stored. The runner does not use them.
 
-SSH fields: `ssh_user`, `ssh_bastion`, `identity_file`, `remote_host`.
+SSH fields: `ssh_user`, `ssh_bastion`, `identity_file`, `auth`, `remote_host`.
 
 Kubectl fields: `context`, `namespace`, `service`, `address`.
 
 - An absent field uses the default. For `remote_host`, the default is `127.0.0.1`.
 - JSON `null` does not use the default. The value stays empty.
 - A string, including `""`, is used as written.
+
+`auth` is `"key"` or `"password"`. `defaults` has no `auth`. An absent or `null` `auth` is `"key"`. Another value is a schema error.
 
 There is no default for kubectl fields. JSON `null` or an absent `address` omits `--address`.
 
@@ -84,17 +87,25 @@ The current file has one list, `mcp`: `mra_auth`, `mcp_account`, `rds_sdip_prod`
 
 ## Password
 
-If the selected list contains an SSH tunnel, the process asks for one password before it starts tunnels.
+The process asks for passwords before it starts tunnels. It asks one time for each `<ssh_user>@<ssh_bastion>` pair of an SSH tunnel with `auth` `password` in the selected list. It asks in list order. If no tunnel in the list uses `password`, the process does not ask.
 
 ```
 Password for <ssh_user>@<ssh_bastion>:
 ```
 
-The user and host come from `defaults`. If a default is empty, the prompt uses `user` and `SSH server`.
+The user and host come from the tunnel. If a value is empty, the prompt uses `user` and `SSH server`.
 
-The password is hidden. One password is used for every SSH tunnel and for later SSH reconnects. An empty password is not sent. The process does not ask again.
+The password is hidden. Tunnels with the same user and host use the same password. Later reconnects use the same password. An empty password is sent as typed. The process does not ask again.
 
 If the terminal cannot be opened, the process prints an error and exits 1. It does not start tunnels.
+
+The process counts auth errors for each user and host only after it attempts a password. If the server does not offer password authentication, the failure does not count. An SSH disconnect with `too many authentication failures` after a password attempt also counts as an auth error. A network error does not count as an auth error. The count does not reset. At 2 errors, the process:
+
+- logs `Password for <ssh_user>@<ssh_bastion> was rejected 2 times. Stopping all tunnels.`
+- does not send that password again. A later start of a tunnel with that user and host fails with `Password for <ssh_user>@<ssh_bastion> was rejected 2 times. It is not sent again.` The start does not open a connection.
+- stops all tunnels as in Shutdown, and exits 1.
+
+If the stop occurs during the start loop, the loop stops before the next tunnel. If it occurs during a monitor pass, that pass stops before the next tunnel.
 
 ## Start
 
@@ -122,20 +133,20 @@ Remote text is `<remote_host>:<remote_port>` for SSH and `<service>:<remote_port
 
 A failed tunnel does not stop the other starts. After the loop, the process prints the running count and `Press Ctrl+C to stop.`
 
-SIGINT and SIGTERM are armed before the start loop. If the signal arrives during start, and at least one tunnel is `running`, the process does not wait. It stops the tunnels. If no tunnel is `running`, it exits 1 and does not run shutdown.
+SIGINT and SIGTERM are armed before the start loop. If a signal arrives during start, the process does not start another tunnel. If at least one tunnel is `running`, the process stops the tunnels. If no tunnel is `running`, it exits 1 and does not run shutdown.
 
 ## SSH
 
 The program uses a Go SSH client. It does not run the `ssh` binary.
 
 - The bastion port is `22`.
-- The dial timeout is 30 seconds.
+- SSH authentication has a 30-second timeout. This includes the TCP connection, agent requests, and SSH handshake.
 - Host-key check is off.
-- Keepalive is every 15 seconds. Three missed replies close the connection.
-- A set key file is used when the file exists. A missing file logs `Key not found: <path>` and the start continues.
-- The agent is used when `SSH_AUTH_SOCK` is set and the socket opens.
-- A non-empty password is sent.
-- Auth order is key file, then agent, then password.
+- Keepalive is every 15 seconds. Each reply has a 45-second timeout. A timeout or request error closes the SSH connection and its local listener.
+- With `auth` `key`, a set key file is used when the file exists. A missing file logs `Key not found: <path>` and the start continues.
+- With `auth` `key`, the agent is used when `SSH_AUTH_SOCK` is set and the socket opens. If the agent cannot list keys, the client can still use the key file. The agent connection closes after authentication. Cancellation also closes a pending agent connection.
+- With `auth` `key`, one public-key authentication method tries the key file, then the agent keys. One agent client serves all public-key authentication steps on the connection. No password is sent.
+- With `auth` `password`, only the password is sent. The key file and the agent are not used.
 - The listener binds all interfaces on `local_port`.
 - The destination is `remote_host:remote_port` as seen from the bastion.
 - Status becomes `running` only after the listener is open.
@@ -171,7 +182,7 @@ Backoff seconds are `min(5 * (2 ** (attempt - 1)), 300)`. A retry runs only on a
 
 ## Shutdown
 
-SIGINT or SIGTERM stops the monitor. The process then stops every tunnel whose status is not `stopped`. This includes status `error`. It prints `Done.` and exits 0.
+SIGINT, SIGTERM, or 2 rejected passwords cancel startup and the monitor. Cancellation closes connections used for pending SSH authentication, including the agent connection. The process waits for the monitor to return before it stops tunnels. A current TCP health check must return first. The process then stops every tunnel whose status is not `stopped`. This includes status `error`. It prints `Done.` It exits 0 after a signal and exits 1 after 2 rejected passwords.
 
 ## Limits
 
@@ -201,11 +212,11 @@ SSH tunnels:
 - `mra_auth` forwards local `8001` to `127.0.0.1:8001`. It is in list `mcp`.
 - `mra_web` forwards local `8181` to `127.0.0.1:8181`.
 - `pd_sdip_dev` forwards local `6432` to `10.104.161.114:5432`.
-- `pg_ad_prod` forwards local `5432` to `10.101.32.81:5432`. The key is JSON `null`, so the default key is not used.
-- `pg_ad_prod_replica` forwards local `5432` to `10.101.33.113:5432`. The key is JSON `null`, so the default key is not used.
-- `pg_changelog` forwards local `5432` to `prod-spm-us-east-1-changelog-rds-0.c1rcypkoolf2.us-east-1.rds.amazonaws.com:5432`. The key is JSON `null`, so the default key is not used.
-- `pg_dev_seal` forwards local `6432` to `10.103.43.27:6432`. The key is JSON `null`, so the default key is not used.
-- `pg_dev_shark` forwards local `6432` to `10.103.36.71:5432`. The key is JSON `null`, so the default key is not used.
+- `pg_ad_prod` forwards local `5432` to `10.101.32.81:5432`. The key is JSON `null`, so the default key is not used. Auth is `password`.
+- `pg_ad_prod_replica` forwards local `5432` to `10.101.33.113:5432`. The key is JSON `null`, so the default key is not used. Auth is `password`.
+- `pg_changelog` forwards local `5432` to `prod-spm-us-east-1-changelog-rds-0.c1rcypkoolf2.us-east-1.rds.amazonaws.com:5432`. The key is JSON `null`, so the default key is not used. Auth is `password`.
+- `pg_dev_seal` forwards local `6432` to `10.103.43.27:6432`. The key is JSON `null`, so the default key is not used. Auth is `password`.
+- `pg_dev_shark` forwards local `6432` to `10.103.36.71:5432`. The key is JSON `null`, so the default key is not used. Auth is `password`.
 - `pg_dev_turtle` forwards local `6432` to `10.103.34.169:6432`.
 - `pg_gateway_aws` forwards local `6432` to `127.0.0.1:5432`.
 - `pg_gateway_prod` forwards local `6432` to `127.0.0.1:5432`.
@@ -216,8 +227,8 @@ SSH tunnels:
 - `pg_sks_dev` forwards local `5432` to `127.0.0.1:5432`.
 - `pg_sks_prod` forwards local `6432` to `127.0.0.1:5432`.
 - `rag` forwards local `8484` to `127.0.0.1:8484`. The key is set to the default key. It is in list `mcp`.
-- `rds_sdip_dev` forwards local `5432` to `rdssdipinstance.cdmwwwue0ooy.eu-west-1.rds.amazonaws.com:5432`. The key is JSON `null`, so the default key is not used.
-- `rds_sdip_prod` forwards local `5432` to `prod-sdip-recommendations-rds-01.cbgcqeymsfvy.eu-west-1.rds.amazonaws.com:5432`. It is in list `mcp`. The key is JSON `null`, so the default key is not used.
+- `rds_sdip_dev` forwards local `5432` to `rdssdipinstance.cdmwwwue0ooy.eu-west-1.rds.amazonaws.com:5432`. The key is JSON `null`, so the default key is not used. Auth is `password`.
+- `rds_sdip_prod` forwards local `5432` to `prod-sdip-recommendations-rds-01.cbgcqeymsfvy.eu-west-1.rds.amazonaws.com:5432`. It is in list `mcp`. The key is JSON `null`, so the default key is not used. Auth is `password`.
 - `redis_sks_dev` forwards local `6378` to `127.0.0.1:6379`.
 - `selenium` forwards local `4444` to `127.0.0.1:4444`.
 - `service_gateway` forwards local `8080` to `127.0.0.1:8000`.
@@ -225,8 +236,8 @@ SSH tunnels:
 - `service_ml_prod` forwards local `8004` to `10.101.37.32:8005`.
 - `service_sea` forwards local `8106` to `127.0.0.1:8106`.
 - `service_sks` forwards local `8501` to `127.0.0.1:8501`.
-- `starrock_mcp` forwards local `9030` to `127.0.0.1:9030`. It is in list `mcp`. The key is JSON `null`, so the default key is not used.
-- `windows` forwards local `3389` to `192.168.2.110:3389`. The bastion is `10.200.200.3`. The key is JSON `null`, so the default key is not used.
+- `starrock_mcp` forwards local `9030` to `127.0.0.1:9030`. It is in list `mcp`. The key is JSON `null`, so the default key is not used. Auth is `password`.
+- `windows` forwards local `3389` to `192.168.2.110:3389`. The bastion is `10.200.200.3`. The key is JSON `null`, so the default key is not used. Auth is `password`.
 
 Kubectl tunnels:
 

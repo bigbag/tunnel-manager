@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 )
 
 type Status string
@@ -54,6 +55,7 @@ type Tunnel struct {
 	SSHUser      string
 	SSHBastion   string
 	IdentityFile string
+	Auth         string
 	RemoteHost   string
 	Context      string
 	Namespace    string
@@ -61,9 +63,22 @@ type Tunnel struct {
 	Address      string
 	LocalPort    int
 	RemotePort   int
-	Status       Status
+	statusMu     sync.RWMutex
+	status       Status
 	PID          int
 	ErrorMessage string
+}
+
+func (t *Tunnel) Status() Status {
+	t.statusMu.RLock()
+	defer t.statusMu.RUnlock()
+	return t.status
+}
+
+func (t *Tunnel) SetStatus(status Status) {
+	t.statusMu.Lock()
+	t.status = status
+	t.statusMu.Unlock()
 }
 
 func (t *Tunnel) RemoteDisplay() string {
@@ -75,6 +90,10 @@ func (t *Tunnel) RemoteDisplay() string {
 	default:
 		return fmt.Sprintf("%d", t.RemotePort)
 	}
+}
+
+func (t *Tunnel) SSHTarget() string {
+	return t.SSHUser + "@" + t.SSHBastion
 }
 
 type List struct {
@@ -132,6 +151,7 @@ type tunnelJSON struct {
 	SSHUser      Field    `json:"ssh_user"`
 	SSHBastion   Field    `json:"ssh_bastion"`
 	IdentityFile Field    `json:"identity_file"`
+	Auth         *string  `json:"auth"`
 	RemoteHost   Field    `json:"remote_host"`
 	Context      *string  `json:"context"`
 	Namespace    *string  `json:"namespace"`
@@ -210,6 +230,13 @@ func buildTunnel(i int, raw tunnelJSON, defaults Defaults) (*Tunnel, error) {
 	if raw.RemotePort == nil {
 		return nil, fmt.Errorf("tunnel %s: missing remote_port", label)
 	}
+	auth := "key"
+	if raw.Auth != nil {
+		auth = *raw.Auth
+	}
+	if auth != "key" && auth != "password" {
+		return nil, fmt.Errorf("tunnel %s: auth must be \"key\" or \"password\", got %q", label, auth)
+	}
 	tags := raw.Tags
 	if tags == nil {
 		tags = []string{}
@@ -222,10 +249,11 @@ func buildTunnel(i int, raw tunnelJSON, defaults Defaults) (*Tunnel, error) {
 		SSHUser:      resolve(raw.SSHUser, defaults.SSHUser),
 		SSHBastion:   resolve(raw.SSHBastion, defaults.SSHBastion),
 		IdentityFile: resolve(raw.IdentityFile, defaults.IdentityFile),
+		Auth:         auth,
 		RemoteHost:   resolve(raw.RemoteHost, "127.0.0.1"),
 		LocalPort:    *raw.LocalPort,
 		RemotePort:   *raw.RemotePort,
-		Status:       StatusStopped,
+		status:       StatusStopped,
 	}
 	if raw.Context != nil {
 		tun.Context = *raw.Context
